@@ -54,14 +54,22 @@
   "Non-nil to treat modified region as single undo."
   :type 'boolean)
 
+(defcustom awk-region-match-re "$0 !~ /^$/"
+  "Regexp to match input line."
+  :type 'regexp)
+
+(defcustom awk-region-fs " "
+  "Regexp for awk field separator FS."
+  :type 'regexp)
+
 
 ;;; Overlays
 
 (cl-defstruct (awk--region (:constructor awk--make-region))
   "Active region."
   command prompt output data
-  (stdout (get-buffer-create (format "*awk-region[%s]::stdout*" (buffer-name))))
-  (stderr (get-buffer-create (format "*awk-region[%s]::stderr*" (buffer-name)))))
+  (stdout (format "*awk-region[%s]::stdout*" (buffer-name)))
+  (stderr (format "*awk-region[%s]::stderr*" (buffer-name))))
 
 (defvar-local awk-region--current nil)
 
@@ -70,11 +78,17 @@
 
 (defun awk-region--make-data-overlay (start end)
   "Create data overlay from START to END."
-  (let ((ov (make-overlay start end nil nil t)))
-    (overlay-put ov 'awk-region 'data)
-    (overlay-put ov 'face '(:inherit region))
-    (setf (awk--region-data awk-region--current) ov)
-    ov))
+  (goto-char start)
+  (insert-before-markers "\n")
+  (let ((out (make-overlay start start nil nil t))
+        (data (make-overlay (point) end)))
+    (overlay-put out 'awk-region 'output)
+    (overlay-put out 'face '(:inherit region))
+    (setf (awk--region-output awk-region--current) out)
+    (overlay-put data 'awk-region 'data)
+    (overlay-put data 'face '(:inherit region))
+    (setf (awk--region-data awk-region--current) data)
+    data))
 
 (defun awk-region--make-command-overlay (start &optional data)
   "Create command overlay at START.
@@ -103,21 +117,21 @@ When DATA is non-nil, include a \"Data: DATA\" line before command line."
       (setf (awk--region-command awk-region--current) ov)
       ov)))
 
-(defun awk-region--current-command ()
+(defun awk-region--command-input (&optional region)
   "Get the current command."
-  (pcase-let (((cl-struct awk--region command) awk-region--current))
+  (pcase-let (((cl-struct awk--region command) (or region awk-region--current)))
     (buffer-substring-no-properties
      (overlay-start command) (overlay-end command))))
 
-(defun awk-region--current-bounds ()
+(defun awk-region--data-bounds (&optional region)
   "Get the bounds of current data region."
-  (pcase-let (((cl-struct awk--region data) awk-region--current))
+  (pcase-let (((cl-struct awk--region data) (or region awk-region--current)))
     (cons (overlay-start data) (overlay-end data))))
 
 (defun awk-region--cleanup-region (&optional region)
   "Cleanup active REGION or default `awk-region--current'."
   (when-let ((r (or region awk-region--current)))
-    (pcase-let (((cl-struct awk--region prompt command data) r))
+    (pcase-let (((cl-struct awk--region prompt command data output) r))
       (let ((inhibit-read-only t))
         (dolist (ov (list prompt command data))
           (when (or awk-region-replace-original
@@ -137,6 +151,7 @@ When DATA is non-nil, include a \"Data: DATA\" line before command line."
 
 (defvar-keymap awk-region-minor-mode-map
   :doc "Active keymap during `awk-region-minor-mode'."
+  "C-c C-c" #'awk-region-run
   "C-c C-k" #'awk-region-abort)
 
 (define-minor-mode awk-region-minor-mode
@@ -173,22 +188,57 @@ When DATA is non-nil, include a \"Data: DATA\" line before command line."
 
 ;;; Process
 
-(defun awk-region--run (&optional region)
-  (pcase-let (((cl-struct awk--region command data stdout stderr)
+(defun awk-region--sanitize (code)
+  (format "print %s" code)
+  ;; (concat
+  ;;  "print \"" 
+  ;;  (->> code (replace-regexp-in-string "\"" "\\\\\"" )
+  ;;       (replace-regexp-in-string "\\(\\$[0-9]+\\)" "\" \\1 \""))
+  ;;  "\"")
+  )
+
+(defun awk-region--awk-code (&optional ov)
+  (let* ((ov (or ov (awk--region-command awk-region--current)))
+         (code
+          (awk-region--sanitize
+           (buffer-substring-no-properties
+            (overlay-start ov) (overlay-end ov))))
+         (begin (if (string= " " awk-region-fs)
+                    ""
+                  (format "BEGIN { FS=\"%s\"; }\n" awk-region-fs))))
+    (format "%s%s { %s }\n/^$/ { print }"
+            begin awk-region-match-re code)))
+
+(defun awk-region--insert-output (text output)
+  (save-excursion
+    (let ((start (overlay-start output)))
+      (goto-char start)
+      (insert text)
+      (delete-region (point) (overlay-end output)))))
+
+(defun awk-region-run (&optional region)
+  (interactive)
+  (pcase-let (((cl-struct awk--region command data output stdout stderr)
                (or region awk-region--current)))
-    (let* ((cmd (buffer-substring-no-properties
-                 (overlay-start command)
-                 (overlay-end command)))
-           (status (shell-command-on-region
-                    (overlay-start data)
-                    (overlay-end data)
-                    cmd
-                    stdout
-                    nil
-                    stderr t)))
+    (let* ((awk-code (awk-region--awk-code command))
+           ;; (stdout (with-current-buffer (get-buffer-create stdout)
+           ;;           (erase-buffer)))
+           ;; (stderr (with-current-buffer (get-buffer-create stderr)
+           ;;           (erase-buffer)))
+           (status
+            (shell-command-on-region
+             (overlay-start data)
+             (overlay-end data)
+             (format "awk '%s'" awk-code)
+             stdout
+             nil
+             stderr)))
       (if (zerop status)
-          (pop-to-buffer stdout)
+          (let ((res (with-current-buffer stdout
+                       (buffer-string))))
+            (awk-region--insert-output res output))
         (pop-to-buffer stderr)))))
+
 
 ;;; Commands
 
@@ -204,7 +254,8 @@ Optionally specify FS or FILE to run code from."
         (insert-before-markers "\n")
         (let ((ov (awk-region--make-command-overlay start)))
           (goto-char (overlay-end ov))
-          (awk-region--run)))
+          ;; (awk-region--run)
+          ))
     (error
      (let (awk-region-replace-original)
        (awk-region-minor-mode -1)))
