@@ -27,8 +27,21 @@
 ;;; Commentary:
 ;;
 ;; Interactively run awk code on region from inline command prompt.
-;;
+;; 
 ;; Inspired by https://www.emacswiki.org/emacs/awk-it.el.
+;;
+;; TODO:
+;; - transient menu:
+;;  - toggle command mode
+;;  - set match regexp
+;;  - set FS, OFS, etc.
+;; - Switch to `edit-indirect-region' with raw mode
+;; - Better undo handling, `yas-snippet-revival'
+;; - Edit & rerun last awk command
+;; - Disable delete at start of command prompt
+;; - Run awk code from file
+;; - Use field with mode FS as data field for prompt?
+;; - When switching b/w modes, worth trying to transform code?
 ;;
 ;;; Code:
 
@@ -43,7 +56,7 @@
   :type 'string)
 
 (defcustom awk-region-commit-action 'replace
-  "Non-nil to replace original region with modified region."
+  "Default action to take when committing awk results."
   :type '(choice (const :tag "Delete" nil)
                  (const :tag "Replace original" replace)
                  (const :tag "Insert in buffer" insert)
@@ -60,6 +73,28 @@
 (defcustom awk-region-fs " "
   "Regexp for awk field separator FS."
   :type 'regexp)
+
+(defcustom awk-region-mode 'print
+  "Awk command mode.
+
+Print mode runs \"print <command>\" on lines matching `awk-region-match-re' with
+some preprocessing of the command:
+ - Single/double quotes, backslashes, and newlines are escaped.
+ - Fields are concatenated with the rest of the text.
+
+Simple mode runs the input command as the body of the rule matching
+`awk-region-match-re'.
+
+Raw mode is full awk syntax."
+  :type '(choice (const :tag "Print" print)
+                 (const :tag "Simple" simple)
+                 (const :tag "Raw" raw)))
+
+(defvar awk-region-simple-template
+  "/^$/ { print }
+%s {
+  %s
+}")
 
 (defface awk-region-command-face
   '((t (:background "#181418")))
@@ -89,20 +124,25 @@
      :foreground "red" :extend))
   "Face for input region.")
 
+(defvar awk-region-debug t)
+
+
+;;; Internal data structures
 
 (defvar-local awk-region--current nil
   "Current active region.")
 
-(cl-defstruct (awk--region (:constructor awk-region--make (&optional buff)))
+(cl-defstruct (awk--region (:constructor awk-region--make)
+                           (:copier nil))
   "Active region."
   example command error output input
-  (stdout (format "*awk-region[%s]::stdout*" (buffer-name buff)))
-  (stderr (format "*awk-region[%s]::stderr*" (buffer-name buff))))
+  (stdout (format "*awk-region[%s]::stdout*" (buffer-name)))
+  (stderr (format "*awk-region[%s]::stderr*" (buffer-name))))
 
 (defun awk-region--make-current (start end)
   "Setup active region for input from START to END."
   (cl-assert (null awk-region--current))
-  (setq awk-region--current (awk-region--make))
+  (setq awk-region--current (awk-region--make (current-buffer)))
   (save-excursion
     (goto-char start)
     (let ((example-data
@@ -138,6 +178,7 @@
          start end 'input
          'face '(:inherit awk-region-input-face :extend t))))
 
+;;; TODO: disable backward delete at beginning of command prompt
 (defun awk-region--make-command-overlay (start &optional example-data)
   "Create command overlay at START.
 When EXAMPLE-DATA is non-nil, include a \"Data: EXAMPLE-DATA\" line before
@@ -291,32 +332,48 @@ With prefix, choose commit ACTION."
 
 ;;; Process
 
-(defun awk-region--quote (code)
+(defun awk-region--escape-quote (code)
   "Replace \"'\" with \\='auto_quote in CODE."
   (replace-regexp-in-string "'" "\" auto_quote \"" code))
 
-(defun awk-region--format-print (code)
-  "Format CODE to be input for awk's print."
-  (thread-last code
+(defun awk-region--build-begin ()
+  "Build BEGIN rule."
+  (if (string= " " awk-region-fs) ""
+    (format "BEGIN { FS=\"%s\"; }\n" awk-region-fs)))
+
+(defun awk-region--preprocess-print (raw-code)
+  "Preprocess RAW-CODE for print mode."
+  (thread-last raw-code
                (replace-regexp-in-string "\\\\" "\\\\\\\\")
                (replace-regexp-in-string "\"" "\\\\\"")
                (replace-regexp-in-string "\\(\\$[0-9]+\\)" "\" \\1 \"")
                (replace-regexp-in-string "\n" "\\\\n\\\\\n")
                (format "print \"%s\"")))
 
-(defun awk-region--awk-code (&optional overlay)
-  "Create awk code from command OVERLAY."
+(defun awk-region--preprocess-simple (raw-code)
+  "Preprocess RAW-CODE for simple mode."
+  raw-code)
+
+(defun awk-region--build-code (&optional overlay)
+  "Build awk code from command in OVERLAY."
   (let* ((overlay (or overlay (awk--region-command awk-region--current)))
          (raw-code (string-chop-newline
                     (buffer-substring-no-properties
-                     (overlay-start overlay) (overlay-end overlay))))
-         ;; TODO: handle extended code modes
-         (code (awk-region--format-print raw-code))
-         (begin (if (string= " " awk-region-fs)
-                    ""
-                  (format "BEGIN { FS=\"%s\"; }\n" awk-region-fs))))
-    (format "%s%s { %s }\n/^$/ { print }"
-            begin awk-region-match-re code)))
+                     (overlay-start overlay) (overlay-end overlay)))))
+    (awk-region--escape-quote
+     (concat (awk-region--build-begin)
+             (if (eq 'raw awk-region-mode)
+                 raw-code
+               (format awk-region-simple-template
+                       awk-region-match-re
+                       (pcase awk-region-mode
+                         ('print (awk-region--preprocess-print raw-code))
+                         ('simple (awk-region--preprocess-simple raw-code))
+                         ('raw raw-code))))))))
+
+;;; TODO: allow editing last code and rerun
+;;; In raw mode, option to use `edit-indirect-region' to edit command input
+(defvar-local awk-region--last-code nil)
 
 (defun awk-region-run (&optional region)
   "Run current command on input.
@@ -326,8 +383,7 @@ If REGION is non-nil, run instead of default active region."
                (or region awk-region--current)))
     (let* ((shell-command-dont-erase-buffer)
            (max-mini-window-height)     ; no message from `shell-command'
-           (awk-code (awk-region--quote
-                      (awk-region--awk-code command)))
+           (awk-code (awk-region--build-code command))
            (status (save-window-excursion
                      (shell-command-on-region
                       (overlay-start input) (overlay-end input)
@@ -340,6 +396,11 @@ If REGION is non-nil, run instead of default active region."
            (error-p (not (zerop status)))
            (res (with-current-buffer (if error-p stderr stdout)
                   (buffer-string))))
+
+      (setq awk-region--last-code awk-code)
+      (when awk-region-debug
+        (message "Code:\n%s" awk-region--last-code))
+
       (awk-region--update-output
        error (and error-p (propertize res 'font-lock-face 'font-lock-warning-face)))
       (awk-region--update-output
@@ -350,7 +411,7 @@ If REGION is non-nil, run instead of default active region."
 ;;; Commands
 
 ;;;###autoload
-(defun awk-region (start end &optional fs file)
+(defun awk-region (start end &optional _fs _file)
   "Run awk commands interactively on region from START to END.
 Optionally specify FS or FILE to run code from.
 
