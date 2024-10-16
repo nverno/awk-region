@@ -27,7 +27,7 @@
 ;;; Commentary:
 ;;
 ;; Interactively run awk code on region from inline command prompt.
-;; 
+;;
 ;; Inspired by https://www.emacswiki.org/emacs/awk-it.el.
 ;;
 ;; TODO(09/27/24):
@@ -111,7 +111,7 @@ Raw mode is full awk syntax."
     (((class color) (min-colors 88) (background dark))
      :background "#335533" :extend t)
     (((class color))
-     :foreground "green" :extend))
+     :foreground "green" :extend t))
   "Face for awk output.")
 
 ;; `smerge-upper'
@@ -121,7 +121,7 @@ Raw mode is full awk syntax."
     (((class color) (min-colors 88) (background dark))
      :background "#553333" :extend t)
     (((class color))
-     :foreground "red" :extend))
+     :foreground "red" :extend t))
   "Face for input region.")
 
 (defvar awk-region-debug t)
